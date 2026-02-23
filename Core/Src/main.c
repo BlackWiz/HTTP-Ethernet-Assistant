@@ -1,6 +1,6 @@
 /* USER CODE BEGIN Header */
 /**
-  * FINAL INTEGRATION: STM32 + ENC28J60 + LwIP
+  * FINAL INTEGRATION: STM32 + ENC28J60 + LwIP + ThingSpeak
   * CS Pin: PA5 (Green LED) - Hardwired Override
   */
 /* USER CODE END Header */
@@ -19,9 +19,19 @@
 #include "enc28j60.h"
 #include "tcp_echo.h"
 #include "http_server.h"
+#include "thingspeak.h" // <-- Added ThingSpeak Driver
+
+#if LWIP_DHCP
+#include "lwip/dhcp.h"  // <-- Needed if DHCP is enabled
+#endif
 
 /* USER CODE BEGIN PV */
 #define STACK_CANARY 0xDEADBEEF
+
+// --- Network Configuration Switch ---
+// 0 = Use Static IP (Direct connection to PC)
+// 1 = Use DHCP (Connection to Router with Internet)
+#define USE_DHCP 1
 /* USER CODE END PV */
 
 /* Global Variables */
@@ -64,7 +74,7 @@ int main(void)
 
   // 2. UART Debug Message
   char msg[100];
-  sprintf(msg, "\r\n--- STM32 + LwIP + ENC28J60 START ---\r\n");
+  sprintf(msg, "\r\n--- STM32 + LwIP + ThingSpeak Client ---\r\n");
   HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
   HAL_Delay(100);
 
@@ -95,20 +105,32 @@ int main(void)
   }
 
   HAL_UART_Transmit(&huart2, (uint8_t*)"Forcing MAC update...\r\n", 23, 100);
-    enc_force_mac_hardware(&henc);
-    HAL_UART_Transmit(&huart2, (uint8_t*)"MAC Updated.\r\n", 14, 100);
+  enc_force_mac_hardware(&henc);
+  HAL_UART_Transmit(&huart2, (uint8_t*)"MAC Updated.\r\n", 14, 100);
 
   // 5. LwIP Init
   lwip_init();
 
-  app_echoserver_init();  // Starts the Echo Server (Port 7)
-  http_server_init();     // Starts your HTTP Server (Port 80) <--- Add this
+//  app_echoserver_init();  // Starts the Echo Server (Port 7)
+//  http_server_init();     // Starts your HTTP Server (Port 80)
+  thingspeak_init();      // Initialize ThingSpeak Client
 
-  // 6. IP Settings
+  // 6. IP Settings Architecture
   ip4_addr_t ipaddr, netmask, gw;
+
+#if USE_DHCP
+  // For DHCP, LwIP requires starting with 0.0.0.0
+  IP4_ADDR(&ipaddr, 0, 0, 0, 0);
+  IP4_ADDR(&netmask, 0, 0, 0, 0);
+  IP4_ADDR(&gw, 0, 0, 0, 0);
+  HAL_UART_Transmit(&huart2, (uint8_t*)"LwIP UP! Requesting DHCP...\r\n", 29, 100);
+#else
+  // Static IP Configuration
   IP4_ADDR(&ipaddr, 192, 168, 0, 200);
   IP4_ADDR(&netmask, 255, 255, 255, 0);
   IP4_ADDR(&gw, 192, 168, 0, 1);
+  HAL_UART_Transmit(&huart2, (uint8_t*)"LwIP UP! Static IP: 192.168.0.200\r\n", 35, 100);
+#endif
 
   // 7. Add Interface
   netif_add(&gnetif, &ipaddr, &netmask, &gw, NULL, &ethernetif_init, &ethernet_input);
@@ -116,21 +138,23 @@ int main(void)
 
   if (netif_is_link_up(&gnetif)) {
       netif_set_up(&gnetif);
-      sprintf(msg, "LwIP UP! IP: 192.168.0.200\r\n");
   } else {
-      netif_set_up(&gnetif);
-      sprintf(msg, "LwIP UP (Forced). IP: 192.168.0.200\r\n");
+      netif_set_up(&gnetif); // Force up
   }
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+
+#if USE_DHCP
+  dhcp_start(&gnetif); // Start the DHCP client process
+#endif
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   uint32_t last_arp_time = 0;
+  uint32_t last_upload_time = 0; // Timer for ThingSpeak
+  int packet_counter = 0;        // Simulated Sensor Data
 
 #if(0)
-
-  /* Simulating a Forced fault */
+  /* Simulating a Forced fault (Disabled for Production) */
   volatile uint32_t *invalid_ptr = (uint32_t *)0xFFFFFFF0;
   *invalid_ptr = 0xDEADBEEF;
 #endif
@@ -140,10 +164,20 @@ int main(void)
     ethernetif_input(&gnetif);
     sys_check_timeouts();
 
-    if (HAL_GetTick() - last_arp_time > 5000)
+    // Heartbeat LED (1 Second)
+    if (HAL_GetTick() - last_arp_time > 1000)
     {
        last_arp_time = HAL_GetTick();
-       HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // Heartbeat
+       HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+    }
+
+    // ThingSpeak Upload (Every 20 Seconds)
+    if (HAL_GetTick() - last_upload_time > 20000)
+    {
+       last_upload_time = HAL_GetTick();
+
+       // Send Uptime (seconds) and packet count to Cloud
+       thingspeak_send(HAL_GetTick()/1000, packet_counter++);
     }
   }
 }
@@ -226,26 +260,18 @@ uint32_t sys_now(void)
 /* USER CODE BEGIN 0 */
 
 // --- 1. THE PANIC PRINTER (Direct Register Access) ---
-// Forces characters out of USART2 even if interrupts are dead
 void UART_Panic_Print(char *str) {
-    USART_TypeDef *uart = USART2; // Change this if you use USART1/3
-
+    USART_TypeDef *uart = USART2;
     while (*str) {
-    	// Wait for TXE_TXFNF (TX Data Register Empty / TX FIFO Not Full)
-		// This flag is set when the TDR register is ready for new data.
         while (!(uart->ISR & USART_ISR_TXE_TXFNF));
-
-        // Write byte to Transmit Data Register
         uart->TDR = *str++;
     }
-    // Wait for TC (Transmission Complete)
     while (!(uart->ISR & USART_ISR_TC));
 }
 
 void UART_Panic_Print_Hex(uint32_t val) {
     char hex[] = "0123456789ABCDEF";
-    char buf[11]; // "0x12345678\0"
-
+    char buf[11];
     buf[0] = '0'; buf[1] = 'x';
     for (int i = 0; i < 8; i++) {
         buf[9 - i] = hex[(val >> (i * 4)) & 0xF];
@@ -256,7 +282,6 @@ void UART_Panic_Print_Hex(uint32_t val) {
 
 // --- 2. THE C HANDLER (Analyzes the Crash) ---
 void HardFault_Handler_C(uint32_t *stack_frame) {
-    // Stack Frame: [0]=R0, [1]=R1, [2]=R2, [3]=R3, [4]=R12, [5]=LR, [6]=PC, [7]=xPSR
     volatile uint32_t r0 = stack_frame[0];
     volatile uint32_t lr = stack_frame[5];
     volatile uint32_t pc = stack_frame[6];
@@ -276,36 +301,33 @@ void HardFault_Handler_C(uint32_t *stack_frame) {
 
     UART_Panic_Print("System Halted. Check your .map file for the PC address.\r\n");
 
-    // Trigger a breakpoint so the debugger stops here automatically
     __asm("bkpt 255");
     while (1);
 }
 
 // --- 3. THE ASSEMBLY SHIM (Captures the Stack Pointer) ---
-// This overrides the default weak definition
 __attribute__((naked)) void HardFault_Handler(void) {
     __asm volatile (
         " movs r0, #4          \n"
         " mov r1, lr           \n"
-        " tst r0, r1           \n" // Check which stack was used
+        " tst r0, r1           \n"
         " bne use_psp          \n"
-        " mrs r0, msp          \n" // Main Stack
+        " mrs r0, msp          \n"
         " b call_c             \n"
         "use_psp:              \n"
-        " mrs r0, psp          \n" // Process Stack
+        " mrs r0, psp          \n"
         "call_c:               \n"
         " ldr r2, =HardFault_Handler_C \n"
-        " bx r2                \n" // Jump to C function
+        " bx r2                \n"
     );
 }
 
 // --- 4. THE STACK PAINTER (Flood Gauge) ---
-extern uint32_t _estack; // Defined in linker script (Top of RAM)
-extern uint32_t _end;    // Defined in linker script (Start of Free RAM)
+extern uint32_t _estack;
+extern uint32_t _end;
 
 static void Paint_Stack(void) {
     uint32_t *p = &_end;
-    // Paint until 64 bytes before the top to be safe
     while (p < (&_estack - 16)) {
         *p++ = STACK_CANARY;
     }

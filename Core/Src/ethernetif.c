@@ -131,8 +131,8 @@ static struct pbuf * low_level_input(struct netif *netif)
 
 	  /* DEBUG: Print Incoming Packet Info */
 	  if (len > 70) {
-	      sprintf(debug_msg, "RX EVENT! Len: %d\r\n", len);
-	      HAL_UART_Transmit(&huart2, (uint8_t*)debug_msg, strlen(debug_msg), 100);
+//	      sprintf(debug_msg, "RX EVENT! Len: %d\r\n", len);
+//	      HAL_UART_Transmit(&huart2, (uint8_t*)debug_msg, strlen(debug_msg), 100);
 	  }
 
 	  /* 3. Allocate Buffer */

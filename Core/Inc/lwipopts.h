@@ -100,9 +100,27 @@
 /*----- Value in opt.h for CHECKSUM_CHECK_ICMP6: 1 -----*/
 #define CHECKSUM_CHECK_ICMP6 0
 /*-----------------------------------------------------------------------------*/
-/* USER CODE BEGIN 1 */
+ /* USER CODE BEGIN 1 */
 
-/* USER CODE END 1 */
+ // --- 1. UDP Support (Critical for DNS) ---
+ // Your file has CHECKSUM_GEN_UDP, but we must explicitly enable the protocol
+ #ifndef LWIP_UDP
+ #define LWIP_UDP                        1
+ #endif
+
+ // --- 2. UDP Control Blocks ---
+ // We need at least one for the DNS client to talk to the DNS server
+ #define MEMP_NUM_UDP_PCB                4
+
+ // --- 3. TCP Optimization for HTTP ---
+ // A larger Segment Size (MSS) prevents fragmenting data into tiny packets
+ #define TCP_MSS                         1460
+
+ // --- 4. TCP Window Size ---
+ // Needs to be at least 2x MSS to allow the server to send data efficiently
+ #define TCP_WND                         (2 * TCP_MSS)
+
+ /* USER CODE END 1 */
 
 #ifdef __cplusplus
 }
